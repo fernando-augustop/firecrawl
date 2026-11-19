@@ -392,7 +392,7 @@ fn job_url(state: &AppState, headers: &HeaderMap, path: &str, id: &str) -> Strin
 }
 
 fn kind_for(path: &str) -> Kind {
-  if path.contains("/batch/scrape/") {
+  if path.ends_with("/batch/scrape") || path.contains("/batch/scrape/") {
     Kind::Batch
   } else {
     Kind::Crawl
