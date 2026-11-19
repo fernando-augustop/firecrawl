@@ -1,17 +1,19 @@
-use std::{net::SocketAddr, process::ExitCode, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
+use url::Url;
 
 use firecrawl_local::{
   cloud::Cloud,
   crawl::{self, CrawlOptions, MapOptions},
+  extract::Extractor,
   guard::NetworkPolicy,
   init::{self, InitOptions},
   login::{self, LoginSession},
   scrape::{BrowserMode, Engine, EngineConfig, ScrapeOptions},
-  serve::{self, ServeConfig},
+  serve::{self, LocalOptions, ServeConfig},
 };
 
 // DOM-heavy work allocates and frees a lot; mimalloc is markedly faster at it
@@ -167,6 +169,15 @@ enum Command {
     /// Override the User-Agent header.
     #[arg(long, env = "FIRECRAWL_LOCAL_USER_AGENT")]
     user_agent: Option<String>,
+    /// Full HTTP(S) /search endpoint of a local SearXNG instance.
+    #[arg(long, env = "FIRECRAWL_LOCAL_SEARXNG_ENDPOINT")]
+    searxng_endpoint: Option<Url>,
+    /// SQLite database for durable crawl and batch results.
+    #[arg(long, env = "FIRECRAWL_LOCAL_JOB_DATABASE")]
+    job_database: Option<PathBuf>,
+    /// HTTP(S) origin used in job URLs behind an approved proxy.
+    #[arg(long, env = "FIRECRAWL_LOCAL_PUBLIC_URL")]
+    public_url: Option<Url>,
   },
 }
 
@@ -197,6 +208,7 @@ async fn launch_mcp(engine: Arc<Engine>) -> Result<(), String> {
     // The MCP server's key is the copy handed to it below, so this process
     // stays the one that decides whether a call is signed in.
     use_client_key: false,
+    local: LocalOptions::default(),
   };
   let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
   let server = tokio::spawn(serve::serve_on(listener, engine, cfg, async move {
@@ -643,6 +655,9 @@ async fn run(cli: Cli) -> ExitCode {
       allowed_hosts,
       allow_private,
       user_agent,
+      searxng_endpoint,
+      job_database,
+      public_url,
     } => {
       let ip: std::net::IpAddr = match host.parse() {
         Ok(ip) => ip,
@@ -657,12 +672,19 @@ async fn run(cli: Cli) -> ExitCode {
       } else {
         NetworkPolicy::PublicOnly
       };
+      let extractor = match Extractor::from_env() {
+        Ok(extractor) => extractor,
+        Err(error) => {
+          eprintln!("{error}");
+          return ExitCode::FAILURE;
+        }
+      };
       let engine = match Engine::new(EngineConfig {
         policy,
         user_agent,
         browser,
       }) {
-        Ok(e) => Arc::new(e),
+        Ok(e) => Arc::new(e.with_server_features(extractor)),
         Err(e) => {
           eprintln!("{e}");
           return ExitCode::FAILURE;
@@ -674,6 +696,11 @@ async fn run(cli: Cli) -> ExitCode {
         allowed_hosts,
         cloud: Cloud::from_env().with_surface(firecrawl_local::cloud::Surface::Serve, None),
         use_client_key: true,
+        local: LocalOptions {
+          searxng_endpoint,
+          job_database,
+          public_url,
+        },
       };
       tokio::spawn(engine.clone().trim_memory_when_idle());
       let served = serve::serve(engine.clone(), cfg).await;

@@ -4,6 +4,22 @@
 
 use url::Url;
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum Parser {
+  Name(String),
+  Pdf(PdfParser),
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfParser {
+  #[serde(rename = "type")]
+  kind: String,
+  max_pages: Option<u32>,
+  pages: Option<Vec<u32>>,
+}
+
 pub enum DocKind {
   Pdf,
   /// An office document, with the URL's file extension as a format hint.
@@ -80,11 +96,37 @@ pub struct ParsedDocument {
   pub pages_needing_ocr: usize,
 }
 
-pub fn parse(kind: &DocKind, body: &[u8]) -> Result<ParsedDocument, String> {
+pub fn parse(kind: &DocKind, body: &[u8], parsers: &[Parser]) -> Result<ParsedDocument, String> {
   match kind {
     DocKind::Pdf => {
-      let result =
-        pdf_inspector::process_pdf_mem(body).map_err(|e| format!("could not read the PDF: {e}"))?;
+      let mut options = pdf_inspector::PdfOptions::new();
+      if let Some(parser) = parsers.iter().find_map(|parser| match parser {
+        Parser::Pdf(parser) if parser.kind == "pdf" => Some(parser),
+        _ => None,
+      }) {
+        if parser.max_pages == Some(0)
+          || parser
+            .pages
+            .as_ref()
+            .is_some_and(|pages| pages.contains(&0))
+        {
+          return Err("PDF page numbers and maxPages must be positive.".into());
+        }
+        if let Some(pages) = &parser.pages {
+          let cap = parser.max_pages.map(|n| n as usize).unwrap_or(usize::MAX);
+          let mut pages = pages.clone();
+          pages.sort_unstable();
+          pages.dedup();
+          options = options.pages(pages.into_iter().take(cap));
+        } else if let Some(max) = parser.max_pages {
+          if max > 100_000 {
+            return Err("PDF maxPages exceeds the supported limit.".into());
+          }
+          options = options.pages(1..=max);
+        }
+      }
+      let result = pdf_inspector::process_pdf_mem_with_options(body, options)
+        .map_err(|e| format!("could not read the PDF: {e}"))?;
       Ok(ParsedDocument {
         markdown: result.markdown.unwrap_or_default(),
         title: result.title.filter(|t| !t.trim().is_empty()),

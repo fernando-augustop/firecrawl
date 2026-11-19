@@ -8,16 +8,11 @@
 //! - bodies must be `application/json`, so a browser cannot post to it
 //!   cross-origin without a preflight that this server never approves.
 
-use std::{
-  collections::HashMap,
-  net::SocketAddr,
-  sync::{Arc, Mutex},
-  time::{Duration, Instant},
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
   body::Bytes,
-  extract::{Path, Request, State},
+  extract::{Path, Query, Request, State},
   http::{header, HeaderMap, Method, StatusCode},
   middleware::{self, Next},
   response::{IntoResponse, Response},
@@ -31,26 +26,14 @@ use futures::stream::{self, StreamExt};
 use crate::{
   cloud::{self, Cloud},
   crawl::{self, CrawlOptions, MapOptions},
+  jobs::{self, Jobs, Kind},
   scrape::{Engine, ScrapeError, ScrapeOptions},
+  search::{Search, SearchError, SearchRequest},
 };
-
-const JOB_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// The largest body passed on to Firecrawl cloud. Local routes keep axum's
 /// 2 MB default; uploads to cloud routes such as /v2/parse need more.
 const FORWARD_BODY_LIMIT: usize = 64 * 1024 * 1024;
-
-/// A crawl or batch scrape. Jobs live in memory and expire after an hour.
-struct Job {
-  status: &'static str,
-  total: usize,
-  data: Vec<Value>,
-  errors: Vec<Value>,
-  created: Instant,
-  task: Option<tokio::task::AbortHandle>,
-}
-
-type Jobs = Mutex<HashMap<String, Arc<Mutex<Job>>>>;
 
 pub struct ServeConfig {
   pub addr: SocketAddr,
@@ -69,6 +52,14 @@ pub struct ServeConfig {
   /// the MCP server it started, whose key is a copy of this process's own
   /// and would otherwise outlive a sign-out.
   pub use_client_key: bool,
+  pub local: LocalOptions,
+}
+
+#[derive(Default)]
+pub struct LocalOptions {
+  pub searxng_endpoint: Option<url::Url>,
+  pub job_database: Option<PathBuf>,
+  pub public_url: Option<url::Url>,
 }
 
 struct AppState {
@@ -77,7 +68,9 @@ struct AppState {
   token: Option<String>,
   use_client_key: bool,
   allowed_hosts: Vec<String>,
-  jobs: Jobs,
+  jobs: Arc<Jobs>,
+  search: Option<Search>,
+  public_url: Option<url::Url>,
 }
 
 fn error_response(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
@@ -364,63 +357,75 @@ fn required_url(payload: &Value) -> Result<String, Response> {
   }
 }
 
-fn new_job(state: &AppState, total: usize) -> (String, Arc<Mutex<Job>>) {
-  let id = uuid::Uuid::new_v4().to_string();
-  let job = Arc::new(Mutex::new(Job {
-    status: "scraping",
-    total,
-    data: Vec::new(),
-    errors: Vec::new(),
-    created: Instant::now(),
-    task: None,
-  }));
-  let mut jobs = locked(&state.jobs);
-  drop_expired(&mut jobs);
-  jobs.insert(id.clone(), job.clone());
-  (id, job)
-}
-
-/// Lock a mutex, taking the data even if another thread panicked while
-/// holding it. A job map with one half-updated job is still usable, and a
-/// panic here would take every other request down with it.
-fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-  mutex
-    .lock()
-    .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Remove jobs older than `JOB_TTL`, stopping any that are still running.
-/// Runs whenever a job is created or looked up, so an expired job is never
-/// served and never keeps working unobserved.
-fn drop_expired(jobs: &mut HashMap<String, Arc<Mutex<Job>>>) {
-  jobs.retain(|_, job| {
-    let mut job = locked(job);
-    let live = job.created.elapsed() < JOB_TTL;
-    if !live {
-      if let Some(task) = job.task.take() {
-        task.abort();
-      }
+fn job_error(error: jobs::Error) -> Response {
+  match error {
+    jobs::Error::Storage => error_response(
+      StatusCode::INTERNAL_SERVER_ERROR,
+      "JOB_STORAGE_FAILED",
+      "The job store is unavailable.",
+    ),
+    jobs::Error::NotFound => {
+      error_response(StatusCode::NOT_FOUND, "JOB_NOT_FOUND", "Job not found.")
     }
-    live
-  });
+    jobs::Error::Full => error_response(
+      StatusCode::TOO_MANY_REQUESTS,
+      "QUEUE_FULL",
+      "Too many jobs are queued or retained. Retry later.",
+    ),
+  }
 }
 
-fn find_job(state: &AppState, id: &str) -> Option<Arc<Mutex<Job>>> {
-  let mut jobs = locked(&state.jobs);
-  drop_expired(&mut jobs);
-  jobs.get(id).cloned()
-}
-
-fn job_url(headers: &HeaderMap, path: &str, id: &str) -> String {
+fn job_url(state: &AppState, headers: &HeaderMap, path: &str, id: &str) -> String {
   let host = headers
     .get(header::HOST)
-    .and_then(|v| v.to_str().ok())
+    .and_then(|value| value.to_str().ok())
     .unwrap_or("127.0.0.1");
-  format!("http://{host}{path}/{id}")
+  let base = state
+    .public_url
+    .as_ref()
+    .filter(|url| {
+      url[url::Position::BeforeHost..url::Position::AfterPort].eq_ignore_ascii_case(host)
+    })
+    .map(|url| url.as_str().trim_end_matches('/').to_string())
+    .unwrap_or_else(|| format!("http://{host}"));
+  format!("{base}{}/{id}", path.trim_end_matches('/'))
+}
+
+fn kind_for(path: &str) -> Kind {
+  if path.contains("/batch/scrape/") {
+    Kind::Batch
+  } else {
+    Kind::Crawl
+  }
+}
+
+fn job_created(
+  state: &AppState,
+  headers: &HeaderMap,
+  path: &str,
+  id: Result<String, jobs::Error>,
+  invalid_urls: Option<Vec<String>>,
+  webhook: Option<crate::webhook::Delivery>,
+) -> Response {
+  match id {
+    Ok(id) => {
+      if let Some(webhook) = webhook {
+        webhook.watch(state.jobs.clone(), kind_for(path), id.clone());
+      }
+      let mut data =
+        json!({ "success": true, "id": id, "url": job_url(state, headers, path, &id) });
+      if let Some(invalid) = invalid_urls {
+        data["invalidURLs"] = json!(invalid);
+      }
+      Json(data).into_response()
+    }
+    Err(error) => job_error(error),
+  }
 }
 
 async fn map_handler(
   State(state): State<Arc<AppState>>,
+  uri: axum::http::Uri,
   headers: HeaderMap,
   body: Bytes,
 ) -> Response {
@@ -432,6 +437,14 @@ async fn map_handler(
     Ok(u) => u,
     Err(r) => return r,
   };
+  let mut payload = payload;
+  if payload.get("sitemap").is_none() {
+    if payload.get("sitemapOnly").and_then(Value::as_bool) == Some(true) {
+      payload["sitemap"] = json!("only");
+    } else if payload.get("ignoreSitemap").and_then(Value::as_bool) == Some(true) {
+      payload["sitemap"] = json!("skip");
+    }
+  }
   let opts: MapOptions = match serde_json::from_value(payload) {
     Ok(o) => o,
     Err(e) => {
@@ -444,10 +457,125 @@ async fn map_handler(
   };
   match crawl::map(state.engine.clone(), &url, &opts).await {
     Ok(links) => {
-      let links = Value::Array(links.into_iter().map(|u| json!({ "url": u })).collect());
+      let links = if uri.path().starts_with("/v1/") {
+        json!(links)
+      } else {
+        Value::Array(links.into_iter().map(|u| json!({ "url": u })).collect())
+      };
       Json(json!({ "success": true, "links": links })).into_response()
     }
     Err(e) => scrape_error(e),
+  }
+}
+
+fn parse_crawl_options(mut payload: Value) -> Result<CrawlOptions, ScrapeError> {
+  // v1 named the depth option maxDepth.
+  if payload.get("maxDiscoveryDepth").is_none() {
+    if let Some(depth) = payload.get("maxDepth").cloned() {
+      payload["maxDiscoveryDepth"] = depth;
+    }
+  }
+  if let Some(delay) = payload.get_mut("delay").filter(|value| !value.is_null()) {
+    let seconds = delay
+      .as_f64()
+      .filter(|seconds| (0.0..=60.0).contains(seconds))
+      .ok_or_else(|| {
+        ScrapeError::new(
+          400,
+          "BAD_REQUEST",
+          "Crawl delay must be between 0 and 60 seconds.",
+        )
+      })?;
+    *delay = json!((1000.0 * seconds).round() as u64);
+  }
+  let opts: CrawlOptions = serde_json::from_value(payload)
+    .map_err(|error| ScrapeError::new(400, "BAD_REQUEST", format!("Invalid options: {error}")))?;
+  if !(1..=jobs::MAX_PAGES).contains(&opts.limit)
+    || !matches!(opts.sitemap.as_str(), "include" | "skip" | "only")
+    || [&opts.include_paths, &opts.exclude_paths]
+      .into_iter()
+      .any(|paths| {
+        paths.len() > 100
+          || paths
+            .iter()
+            .any(|path| path.len() > 1000 || regex::Regex::new(path).is_err())
+      })
+  {
+    return Err(ScrapeError::new(
+      400,
+      "BAD_REQUEST",
+      "Invalid crawl page limit, sitemap mode or path expressions.",
+    ));
+  }
+  Ok(opts)
+}
+
+async fn crawl_parameters(
+  state: &AppState,
+  url: &str,
+  prompt: &Value,
+) -> Result<serde_json::Map<String, Value>, ScrapeError> {
+  let prompt = prompt
+    .as_str()
+    .map(str::trim)
+    .filter(|prompt| !prompt.is_empty() && prompt.len() <= 10_000)
+    .ok_or_else(|| {
+      ScrapeError::new(
+        400,
+        "BAD_REQUEST",
+        "Crawl prompt must contain 1 to 10000 bytes.",
+      )
+    })?;
+  let parsed = crate::scrape::parse_url(url)?;
+  crate::guard::check_url(&parsed, state.engine.policy())
+    .map_err(|error| ScrapeError::new(403, "BLOCKED_TARGET", error.0))?;
+  let extractor = state.engine.extractor().ok_or_else(|| {
+    ScrapeError::new(
+      503,
+      "EXTRACTION_UNAVAILABLE",
+      "Set a local extraction endpoint to generate crawl parameters.",
+    )
+  })?;
+  let map = MapOptions {
+    limit: 20,
+    sitemap: "skip".into(),
+    include_subdomains: false,
+    ..Default::default()
+  };
+  let mut links = crawl::map(state.engine.clone(), url, &map).await?;
+  if links.is_empty() {
+    links.push(parsed.to_string());
+  }
+  let parameters = extractor.crawl_parameters(prompt, &links).await?;
+  parse_crawl_options(json!(parameters)).map_err(|_| {
+    ScrapeError::new(
+      502,
+      "EXTRACTION_INVALID_OUTPUT",
+      "The extraction provider generated invalid crawl parameters.",
+    )
+  })?;
+  Ok(parameters)
+}
+
+async fn crawl_preview(
+  State(state): State<Arc<AppState>>,
+  headers: HeaderMap,
+  body: Bytes,
+) -> Response {
+  let payload = match json_body(&headers, &body) {
+    Ok(v) => v,
+    Err(r) => return r,
+  };
+  let url = match required_url(&payload) {
+    Ok(u) => u,
+    Err(r) => return r,
+  };
+  match crawl_parameters(&state, &url, payload.get("prompt").unwrap_or(&Value::Null)).await {
+    Ok(mut data) => {
+      data.insert("url".into(), json!(url));
+      Json(json!({ "success": true, "data": data })).into_response()
+    }
+    Err(error) => scrape_error(error),
   }
 }
 
@@ -465,52 +593,36 @@ async fn crawl_handler(
     Ok(u) => u,
     Err(r) => return r,
   };
+  let webhook =
+    match crate::webhook::Delivery::from_payload(payload.get("webhook"), state.engine.fetcher()) {
+      Ok(webhook) => webhook,
+      Err(error) => return scrape_error(error),
+    };
   let mut payload = payload;
-  // v1 named the depth option maxDepth.
-  if let Some(depth) = payload.get("maxDepth").cloned() {
-    if payload.get("maxDiscoveryDepth").is_none() {
-      payload["maxDiscoveryDepth"] = depth;
+  if let Some(prompt) = payload.get("prompt") {
+    let generated = match crawl_parameters(&state, &url, prompt).await {
+      Ok(parameters) => parameters,
+      Err(error) => return scrape_error(error),
+    };
+    if let Some(object) = payload.as_object_mut() {
+      for (key, value) in generated {
+        object.entry(key).or_insert(value);
+      }
     }
   }
-  let opts: CrawlOptions = match serde_json::from_value(payload) {
-    Ok(o) => o,
-    Err(e) => {
-      return error_response(
-        StatusCode::BAD_REQUEST,
-        "BAD_REQUEST",
-        format!("Invalid options: {e}"),
-      )
-    }
+  let opts = match parse_crawl_options(payload) {
+    Ok(opts) => opts,
+    Err(error) => return scrape_error(error),
   };
-  let (id, job) = new_job(&state, 0);
   let engine = state.engine.clone();
-  let task_job = job.clone();
-  let handle = tokio::spawn(async move {
-    let sink = task_job.clone();
-    let result = crawl::crawl(engine, &url, &opts, move |page| {
-      if let Ok(mut j) = sink.lock() {
-        j.data.push(page.clone());
-        j.total = j.data.len();
-      }
+  let id = state.jobs.start(Kind::Crawl, 0, move |job| async move {
+    let result = crawl::crawl_to_store(engine, &url, &opts, |page| job.append(page)).await?;
+    Ok(jobs::Outcome {
+      errors: result.errors,
+      robots_blocked: result.robots_blocked,
     })
-    .await;
-    if let Ok(mut j) = task_job.lock() {
-      match result {
-        Ok(outcome) => {
-          j.errors = outcome.errors;
-          j.total = j.data.len();
-          j.status = "completed";
-        }
-        Err(e) => {
-          j.errors.push(json!({ "error": e.message, "code": e.code }));
-          j.status = "failed";
-        }
-      }
-    }
   });
-  locked(&job).task = Some(handle.abort_handle());
-  let base = req_uri.path().trim_end_matches('/').to_string();
-  Json(json!({ "success": true, "id": id, "url": job_url(&headers, &base, &id) })).into_response()
+  job_created(&state, &headers, req_uri.path(), id, None, webhook)
 }
 
 async fn batch_handler(
@@ -523,20 +635,47 @@ async fn batch_handler(
     Ok(v) => v,
     Err(r) => return r,
   };
-  let urls: Vec<String> = payload
+  let webhook =
+    match crate::webhook::Delivery::from_payload(payload.get("webhook"), state.engine.fetcher()) {
+      Ok(webhook) => webhook,
+      Err(error) => return scrape_error(error),
+    };
+  let Some(urls) = payload
     .get("urls")
     .and_then(Value::as_array)
-    .map(|a| {
-      a.iter()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect()
-    })
-    .unwrap_or_default();
-  if urls.is_empty() {
+    .filter(|urls| !urls.is_empty() && urls.len() <= jobs::MAX_PAGES)
+    .and_then(|urls| urls.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+  else {
     return error_response(
       StatusCode::BAD_REQUEST,
       "BAD_REQUEST",
-      "The 'urls' field needs at least one URL.",
+      "The 'urls' field must contain between one and the maximum number of URL strings.",
+    );
+  };
+  let ignore_invalid = payload.get("ignoreInvalidURLs").and_then(Value::as_bool) == Some(true);
+  let mut accepted = Vec::new();
+  let mut invalid = Vec::new();
+  for url in urls {
+    let parsed = crate::scrape::parse_url(url).ok();
+    if let Some(parsed) =
+      parsed.filter(|url| crate::guard::check_url(url, state.engine.policy()).is_ok())
+    {
+      accepted.push(parsed.to_string());
+    } else if ignore_invalid {
+      invalid.push(url.to_string());
+    } else {
+      return error_response(
+        StatusCode::BAD_REQUEST,
+        "BAD_REQUEST",
+        "The batch contains an invalid or disallowed URL.",
+      );
+    }
+  }
+  if accepted.is_empty() {
+    return error_response(
+      StatusCode::BAD_REQUEST,
+      "BAD_REQUEST",
+      "The batch has no valid URLs.",
     );
   }
   let concurrency = payload
@@ -555,71 +694,132 @@ async fn batch_handler(
       )
     }
   };
-  let (id, job) = new_job(&state, urls.len());
   let engine = state.engine.clone();
-  let task_job = job.clone();
-  let handle = tokio::spawn(async move {
-    let mut results = stream::iter(urls.into_iter().map(|url| {
-      let engine = engine.clone();
-      let opts = opts.clone();
-      async move {
-        let res = engine.scrape(&url, &opts).await;
-        (url, res)
-      }
-    }))
-    .buffer_unordered(concurrency);
-    while let Some((url, res)) = results.next().await {
-      if let Ok(mut j) = task_job.lock() {
-        match res {
-          Ok(doc) => j.data.push(doc),
-          Err(e) => j
-            .errors
-            .push(json!({ "url": url, "error": e.message, "code": e.code })),
+  let id = state
+    .jobs
+    .start(Kind::Batch, accepted.len(), move |job| async move {
+      let mut results = stream::iter(accepted.into_iter().map(|url| {
+        let engine = engine.clone();
+        let opts = opts.clone();
+        async move {
+          let result = engine.scrape(&url, &opts).await;
+          (url, result)
+        }
+      }))
+      .buffer_unordered(concurrency);
+      let mut errors = Vec::new();
+      while let Some((url, result)) = results.next().await {
+        match result {
+          Ok(doc) => job.append(&doc)?,
+          Err(error) => {
+            errors.push(json!({ "url": url, "error": error.message, "code": error.code }))
+          }
         }
       }
-    }
-    if let Ok(mut j) = task_job.lock() {
-      j.status = "completed";
-    }
-  });
-  locked(&job).task = Some(handle.abort_handle());
-  let base = req_uri.path().trim_end_matches('/').to_string();
-  Json(json!({ "success": true, "id": id, "url": job_url(&headers, &base, &id) })).into_response()
+      Ok(jobs::Outcome {
+        errors,
+        ..Default::default()
+      })
+    });
+  job_created(
+    &state,
+    &headers,
+    req_uri.path(),
+    id,
+    ignore_invalid.then_some(invalid),
+    webhook,
+  )
 }
 
-async fn job_status(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-  let job = find_job(&state, &id);
-  let Some(job) = job else {
-    return error_response(StatusCode::NOT_FOUND, "JOB_NOT_FOUND", "Job not found.");
-  };
-  let j = locked(&job);
-  let expires = (JOB_TTL.saturating_sub(j.created.elapsed())).as_secs();
-  Json(json!({
-    "success": true,
-    "status": j.status,
-    "total": j.total.max(j.data.len()),
-    "completed": j.data.len(),
-    "creditsUsed": 0,
-    "expiresInSeconds": expires,
-    "errors": j.errors,
-    "data": j.data,
-  }))
-  .into_response()
+#[derive(serde::Deserialize)]
+struct Pagination {
+  #[serde(default)]
+  skip: usize,
 }
 
-async fn job_cancel(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-  let job = find_job(&state, &id);
-  let Some(job) = job else {
-    return error_response(StatusCode::NOT_FOUND, "JOB_NOT_FOUND", "Job not found.");
-  };
-  let mut j = locked(&job);
-  if j.status == "scraping" {
-    if let Some(task) = j.task.take() {
-      task.abort();
+async fn job_status(
+  State(state): State<Arc<AppState>>,
+  uri: axum::http::Uri,
+  Path(id): Path<String>,
+  Query(page): Query<Pagination>,
+  headers: HeaderMap,
+) -> Response {
+  match state.jobs.status(kind_for(uri.path()), &id, page.skip) {
+    Ok(mut status) => {
+      if let Some(offset) = status.next {
+        let path = uri
+          .path()
+          .rsplit_once('/')
+          .map(|(base, _)| base)
+          .unwrap_or(uri.path());
+        status.value["next"] = json!(format!(
+          "{}?skip={offset}",
+          job_url(&state, &headers, path, &id)
+        ));
+      }
+      Json(status.value).into_response()
     }
-    j.status = "cancelled";
+    Err(error) => job_error(error),
   }
-  Json(json!({ "success": true, "status": "cancelled" })).into_response()
+}
+
+async fn job_cancel(
+  State(state): State<Arc<AppState>>,
+  uri: axum::http::Uri,
+  Path(id): Path<String>,
+) -> Response {
+  match state.jobs.cancel(kind_for(uri.path()), &id) {
+    Ok(true) => Json(json!({ "success": true, "status": "cancelled" })).into_response(),
+    Ok(false) => error_response(
+      StatusCode::CONFLICT,
+      "JOB_ALREADY_FINISHED",
+      "This job already finished.",
+    ),
+    Err(error) => job_error(error),
+  }
+}
+
+async fn job_errors(
+  State(state): State<Arc<AppState>>,
+  uri: axum::http::Uri,
+  Path(id): Path<String>,
+) -> Response {
+  match state.jobs.errors(kind_for(uri.path()), &id) {
+    Ok(errors) => Json(errors).into_response(),
+    Err(error) => job_error(error),
+  }
+}
+
+async fn active_crawls(State(state): State<Arc<AppState>>) -> Response {
+  match state.jobs.active_crawls() {
+    Ok(crawls) => Json(crawls).into_response(),
+    Err(error) => job_error(error),
+  }
+}
+
+async fn queue_status(State(state): State<Arc<AppState>>) -> Response {
+  match state.jobs.summary() {
+    Ok(stats) => Json(json!({
+      "success": true,
+      "jobsInQueue": stats.active + stats.waiting,
+      "activeJobsInQueue": stats.active,
+      "waitingJobsInQueue": stats.waiting,
+      "maxConcurrency": stats.max,
+      "mostRecentSuccess": stats.most_recent_success,
+    }))
+    .into_response(),
+    Err(error) => job_error(error),
+  }
+}
+
+async fn concurrency_status(State(state): State<Arc<AppState>>) -> Response {
+  match state.jobs.summary() {
+    Ok(stats) => {
+      Json(json!({ "success": true, "concurrency": stats.active, "maxConcurrency": stats.max }))
+        .into_response()
+    }
+    Err(error) => job_error(error),
+  }
 }
 
 async fn scrape_handler(
@@ -666,8 +866,52 @@ async fn scrape_handler(
   }
 }
 
+async fn search_handler(
+  State(state): State<Arc<AppState>>,
+  headers: HeaderMap,
+  body: Bytes,
+) -> Response {
+  let Some(search) = &state.search else {
+    return pass_on(&state, Method::POST, "/v2/search", &headers, body).await;
+  };
+  let payload = match json_body(&headers, &body) {
+    Ok(payload) => payload,
+    Err(response) => return response,
+  };
+  let request: SearchRequest = match serde_json::from_value(payload) {
+    Ok(request) => request,
+    Err(error) => return error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", error.to_string()),
+  };
+  match search.run(&state.engine, request).await {
+    Ok(results) => Json(results).into_response(),
+    Err(SearchError::Invalid(message)) => {
+      error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", message)
+    }
+    Err(SearchError::Backend) => error_response(
+      StatusCode::BAD_GATEWAY,
+      "SEARCH_UNAVAILABLE",
+      "SearXNG did not return search results.",
+    ),
+  }
+}
+
+async fn root() -> impl IntoResponse {
+  Json(json!({"message": "Firecrawl API"}))
+}
+
 async fn health() -> impl IntoResponse {
   Json(json!({ "status": "ok", "engine": "firecrawl-local", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+async fn ready(State(state): State<Arc<AppState>>) -> Response {
+  let browser = state.engine.browser_state().await;
+  let ready = !matches!(browser, "disconnected" | "unavailable");
+  let status = if ready {
+    StatusCode::OK
+  } else {
+    StatusCode::SERVICE_UNAVAILABLE
+  };
+  (status, Json(json!({ "ready": ready, "browser": browser }))).into_response()
 }
 
 /// Resolves on Ctrl-C or, on Unix, SIGTERM, so the caller can stop the
@@ -732,25 +976,70 @@ pub async fn serve_on(
     allowed_hosts.push(cfg.addr.ip().to_string());
   }
 
+  let public_url = cfg.local.public_url;
+  if public_url.as_ref().is_some_and(|url| {
+    !matches!(url.scheme(), "http" | "https")
+      || !url.has_host()
+      || !url.username().is_empty()
+      || url.password().is_some()
+      || url.path() != "/"
+      || url.query().is_some()
+      || url.fragment().is_some()
+  }) {
+    return Err("Set the public server URL to an HTTP(S) origin without credentials, path, query or fragment.".into());
+  }
+  let jobs = Jobs::open(cfg.local.job_database.as_deref(), 2)
+    .map_err(|_| "Could not open the Firecrawl job database.")?;
+  let cleanup_jobs = Arc::downgrade(&jobs);
+  tokio::spawn(async move {
+    loop {
+      tokio::time::sleep(Duration::from_secs(60)).await;
+      let Some(jobs) = cleanup_jobs.upgrade() else {
+        break;
+      };
+      let _ = jobs.purge();
+    }
+  });
   let state = Arc::new(AppState {
     engine,
     cloud: cfg.cloud,
     token: cfg.token,
     use_client_key: cfg.use_client_key,
     allowed_hosts,
-    jobs: Mutex::new(HashMap::new()),
+    jobs,
+    public_url,
+    search: cfg.local.searxng_endpoint.map(Search::new).transpose()?,
   });
 
-  let app = Router::new()
+  let mut app = Router::new()
+    .route("/", get(root))
+    .route("/v1/scrape", post(scrape_handler))
+    .route("/v1/map", post(map_handler))
+    .route("/v1/crawl", post(crawl_handler))
+    .route("/v1/crawl/{id}", get(job_status).delete(job_cancel))
+    .route("/v1/crawl/{id}/errors", get(job_errors))
+    .route("/v1/batch/scrape", post(batch_handler))
+    .route("/v1/batch/scrape/{id}", get(job_status).delete(job_cancel))
     .route("/v2/scrape", post(scrape_handler))
     .route("/v2/map", post(map_handler))
     .route("/v2/crawl", post(crawl_handler))
+    .route("/v2/crawl/params-preview", post(crawl_preview))
     .route("/v2/crawl/{id}", get(job_status))
     .route("/v2/crawl/{id}", delete(job_cancel))
+    .route("/v2/crawl/{id}/errors", get(job_errors))
+    .route("/v2/crawl/active", get(active_crawls))
     .route("/v2/batch/scrape", post(batch_handler))
     .route("/v2/batch/scrape/{id}", get(job_status))
     .route("/v2/batch/scrape/{id}", delete(job_cancel))
+    .route("/v2/batch/scrape/{id}/errors", get(job_errors))
+    .route("/v2/team/queue-status", get(queue_status))
+    .route("/v2/concurrency-check", get(concurrency_status))
     .route("/health", get(health))
+    .route("/ready", get(ready));
+  if state.search.is_some() {
+    app = app.route("/v2/search", post(search_handler));
+  }
+  let app = app
     .fallback(forward_handler)
     .layer(middleware::from_fn_with_state(state.clone(), gate))
     .with_state(state);
@@ -835,6 +1124,7 @@ mod tests {
       cloud: Cloud::new(cloud::echo_cloud().await, own_key.map(str::to_string), mode)
         .with_install_id("test-install"),
       use_client_key,
+      local: LocalOptions::default(),
     };
     tokio::spawn(serve_on(listener, engine, cfg, std::future::pending()));
     format!("http://{addr}")

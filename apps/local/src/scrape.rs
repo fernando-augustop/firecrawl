@@ -20,6 +20,8 @@ pub enum Format {
   Html,
   RawHtml,
   Links,
+  Images,
+  Attributes,
   Screenshot,
 }
 
@@ -30,6 +32,8 @@ impl Format {
       "html" => Some(Format::Html),
       "rawHtml" | "raw_html" | "rawhtml" => Some(Format::RawHtml),
       "links" => Some(Format::Links),
+      "images" => Some(Format::Images),
+      "attributes" => Some(Format::Attributes),
       "screenshot" | "screenshot@fullPage" => Some(Format::Screenshot),
       _ => None,
     }
@@ -38,7 +42,7 @@ impl Format {
 
 /// The subset of Firecrawl's scrape options the local engine honours. Unknown
 /// fields are accepted and ignored so existing clients keep working.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ScrapeOptions {
   pub formats: Vec<Value>,
@@ -50,6 +54,11 @@ pub struct ScrapeOptions {
   pub headers: HashMap<String, String>,
   /// Milliseconds to wait after the page loads. Uses the local browser.
   pub wait_for: Option<u64>,
+  pub max_age: Option<u64>,
+  pub block_ads: bool,
+  pub skip_tls_verification: bool,
+  pub remove_base64_images: bool,
+  pub parsers: Vec<crate::documents::Parser>,
 }
 
 impl Default for ScrapeOptions {
@@ -62,6 +71,11 @@ impl Default for ScrapeOptions {
       timeout: None,
       headers: HashMap::new(),
       wait_for: None,
+      max_age: None,
+      block_ads: false,
+      skip_tls_verification: false,
+      remove_base64_images: false,
+      parsers: Vec::new(),
     }
   }
 }
@@ -103,7 +117,7 @@ pub struct ScrapeError {
 }
 
 impl ScrapeError {
-  fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
+  pub(crate) fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
     Self {
       status,
       code,
@@ -148,10 +162,13 @@ pub struct EngineConfig {
 pub struct Engine {
   fetcher: Fetcher,
   browser: Option<Arc<BrowserPool>>,
+  browser_without_tls_verification: Option<Arc<BrowserPool>>,
   browser_mode: BrowserMode,
   in_flight: std::sync::atomic::AtomicUsize,
   dirty: std::sync::atomic::AtomicBool,
   parse_slots: tokio::sync::Semaphore,
+  extractor: Option<crate::extract::Extractor>,
+  cache: Option<crate::cache::Cache>,
 }
 
 struct InFlight<'a>(&'a Engine);
@@ -261,9 +278,13 @@ impl Engine {
       BrowserMode::Never => None,
       _ => BrowserPool::new(cfg.policy, &user_agent, 6),
     };
+    let browser_without_tls_verification = browser
+      .as_ref()
+      .and_then(|_| BrowserPool::new_with_tls(cfg.policy, &user_agent, 1, false));
     Ok(Self {
       fetcher: Fetcher::new(cfg.policy, cfg.user_agent.as_deref())?,
       browser,
+      browser_without_tls_verification,
       browser_mode: cfg.browser,
       in_flight: std::sync::atomic::AtomicUsize::new(0),
       dirty: std::sync::atomic::AtomicBool::new(false),
@@ -272,6 +293,8 @@ impl Engine {
           .map(|n| n.get())
           .unwrap_or(4),
       ),
+      extractor: None,
+      cache: None,
     })
   }
 
@@ -279,8 +302,18 @@ impl Engine {
     self.fetcher.policy()
   }
 
+  pub fn with_server_features(mut self, extractor: Option<crate::extract::Extractor>) -> Self {
+    self.extractor = extractor;
+    self.cache = Some(crate::cache::Cache::default());
+    self
+  }
+
   pub fn fetcher(&self) -> &Fetcher {
     &self.fetcher
+  }
+
+  pub(crate) fn extractor(&self) -> Option<&crate::extract::Extractor> {
+    self.extractor.as_ref()
   }
 
   /// True when a Chromium-family browser was found for JavaScript pages.
@@ -288,14 +321,34 @@ impl Engine {
     self.browser.is_some()
   }
 
+  pub async fn browser_state(&self) -> &'static str {
+    match &self.browser {
+      Some(browser) => browser.state().await,
+      None if self.browser_mode == BrowserMode::Never => "disabled",
+      None => "unavailable",
+    }
+  }
+
   /// Run for the life of a long-lived process (`serve`, `mcp`): whenever the
   /// engine goes idle after doing work, hand freed memory back to the system.
   pub async fn trim_memory_when_idle(self: Arc<Self>) {
     use std::sync::atomic::Ordering;
+    let browser_idle = std::env::var("FIRECRAWL_LOCAL_BROWSER_IDLE_SECS")
+      .ok()
+      .and_then(|value| value.parse::<u64>().ok())
+      .filter(|&seconds| seconds > 0)
+      .map(Duration::from_secs);
     loop {
       tokio::time::sleep(Duration::from_secs(2)).await;
       if self.in_flight.load(Ordering::SeqCst) == 0 && self.dirty.swap(false, Ordering::SeqCst) {
         let _ = tokio::task::spawn_blocking(crate::mem::release_free_memory).await;
+      }
+      if let (Some(browser), Some(timeout)) = (&self.browser, browser_idle) {
+        browser.stop_if_idle(timeout).await;
+      }
+      if let (Some(browser), Some(timeout)) = (&self.browser_without_tls_verification, browser_idle)
+      {
+        browser.stop_if_idle(timeout).await;
       }
     }
   }
@@ -303,6 +356,9 @@ impl Engine {
   /// Stop the browser, if one was started.
   pub async fn shutdown(&self) {
     if let Some(b) = &self.browser {
+      b.shutdown().await;
+    }
+    if let Some(b) = &self.browser_without_tls_verification {
       b.shutdown().await;
     }
   }
@@ -340,6 +396,51 @@ impl Engine {
   /// Scrape one URL and return the `data` object of a Firecrawl scrape
   /// response.
   pub async fn scrape(&self, url: &str, opts: &ScrapeOptions) -> Result<Value, ScrapeError> {
+    if let Some((cache, key)) = self.cache.as_ref().zip(crate::cache::Cache::key(url, opts)) {
+      if let Some(page) = cache.get(key, opts.max_age.unwrap_or(crate::cache::DEFAULT_MAX_AGE)) {
+        return Ok(page);
+      }
+      let page = self.scrape_uncached(url, opts).await?;
+      cache.insert(key, &page);
+      return Ok(page);
+    }
+    self.scrape_uncached(url, opts).await
+  }
+
+  async fn scrape_uncached(&self, url: &str, opts: &ScrapeOptions) -> Result<Value, ScrapeError> {
+    if !opts
+      .formats
+      .iter()
+      .any(|format| crate::extract::kind(format).is_some())
+    {
+      return self.scrape_page(url, opts).await;
+    }
+    let extractor = self.extractor.as_ref().ok_or_else(|| {
+      ScrapeError::new(
+        503,
+        "EXTRACTION_UNAVAILABLE",
+        "Set a local extraction endpoint to use json, summary or question.",
+      )
+    })?;
+    let mut page_opts = opts.clone();
+    page_opts
+      .formats
+      .retain(|format| crate::extract::kind(format).is_none());
+    let wants_markdown = page_opts.resolved_formats().0.contains(&Format::Markdown);
+    if !wants_markdown {
+      page_opts.formats.push(json!("markdown"));
+    }
+    let page = self.scrape_page(url, &page_opts).await?;
+    let mut result = extractor.apply(page, &opts.formats).await?;
+    if !wants_markdown {
+      if let Some(fields) = result.as_object_mut() {
+        fields.remove("markdown");
+      }
+    }
+    Ok(result)
+  }
+
+  async fn scrape_page(&self, url: &str, opts: &ScrapeOptions) -> Result<Value, ScrapeError> {
     self
       .in_flight
       .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -364,6 +465,7 @@ impl Engine {
       let fetch_opts = FetchOptions {
         headers: opts.headers.clone(),
         timeout: Some(timeout),
+        skip_tls_verification: opts.skip_tls_verification,
       };
       let can_render = self.browser_mode == BrowserMode::Auto && self.browser.is_some();
       let mut target = parsed.clone();
@@ -414,12 +516,13 @@ impl Engine {
         crate::documents::sniff(&fetched.body, mime.as_deref(), &fetched.final_url)
       {
         let body = fetched.body.clone();
+        let parsers = opts.parsers.clone();
         let parsed_doc = tokio::task::spawn_blocking(move || {
           let label = match kind {
             crate::documents::DocKind::Pdf => "local-pdf",
             crate::documents::DocKind::Office(_) => "local-document",
           };
-          crate::documents::parse(&kind, &body).map(|d| (d, label))
+          crate::documents::parse(&kind, &body, &parsers).map(|d| (d, label))
         })
         .await
         .map_err(|e| ScrapeError::new(500, "PARSE_FAILED", e.to_string()))?
@@ -605,8 +708,12 @@ impl Engine {
     timeout: Duration,
     screenshot: bool,
   ) -> Result<(Map<String, Value>, String), ScrapeError> {
-    let browser = self
-      .browser
+    let browser = if opts.skip_tls_verification {
+      &self.browser_without_tls_verification
+    } else {
+      &self.browser
+    };
+    let browser = browser
       .as_ref()
       .ok_or_else(|| ScrapeError::new(501, "NO_BROWSER", "No Chrome was found on this machine."))?;
     let rendered = browser
@@ -615,6 +722,8 @@ impl Engine {
         wait_for,
         timeout.max(Duration::from_secs(10)),
         screenshot,
+        opts.block_ads,
+        &opts.headers,
       )
       .await
       .map_err(|m| {
@@ -703,6 +812,83 @@ fn process_html(
       .map_err(|e| ScrapeError::new(500, "PARSE_FAILED", e))?;
     data.insert("links".into(), json!(resolve_links(hrefs, &base)));
   }
+  if formats.contains(&Format::Images) {
+    let base = Url::parse(&html::base_href_of_document(&document, final_url))
+      .unwrap_or_else(|_| final_url.clone());
+    let mut seen = std::collections::HashSet::new();
+    let images: Vec<_> = document
+      .select("img[src]")
+      .into_iter()
+      .flatten()
+      .filter_map(|node| {
+        let attrs = node.attributes.borrow();
+        let url = base.join(attrs.get("src")?).ok()?;
+        let allowed = matches!(url.scheme(), "http" | "https")
+          || (url.scheme() == "data" && !opts.remove_base64_images);
+        if allowed && seen.insert(url.clone()) {
+          Some(url.to_string())
+        } else {
+          None
+        }
+      })
+      .collect();
+    data.insert("images".into(), json!(images));
+  }
+  if formats.contains(&Format::Attributes) {
+    let mut attributes = Vec::new();
+    for item in opts
+      .formats
+      .iter()
+      .filter(|item| item.get("type").and_then(Value::as_str) == Some("attributes"))
+    {
+      let selectors = item
+        .get("selectors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+          ScrapeError::new(400, "BAD_REQUEST", "attributes requires a selectors array.")
+        })?;
+      for selection in selectors {
+        let Some((selector, attribute)) = selection
+          .get("selector")
+          .and_then(Value::as_str)
+          .zip(selection.get("attribute").and_then(Value::as_str))
+        else {
+          return Err(ScrapeError::new(
+            400,
+            "BAD_REQUEST",
+            "Every attributes selector needs a selector and an attribute.",
+          ));
+        };
+        let values: Vec<_> = document
+          .select(selector)
+          .map_err(|_| ScrapeError::new(400, "BAD_REQUEST", "Invalid CSS attribute selector."))?
+          .filter_map(|node| node.attributes.borrow().get(attribute).map(str::to_string))
+          .collect();
+        attributes.push(json!({"selector": selector, "attribute": attribute, "values": values}));
+      }
+    }
+    data.insert("attributes".into(), json!(attributes));
+  }
+  let raw_html = if opts.remove_base64_images {
+    if let Ok(images) = document.select("img") {
+      for image in images {
+        let mut attrs = image.attributes.borrow_mut();
+        for name in ["src", "srcset", "data-src", "data-srcset"] {
+          if attrs.get(name).is_some_and(|source| {
+            source
+              .trim_start()
+              .to_ascii_lowercase()
+              .starts_with("data:image/")
+          }) {
+            attrs.remove(name);
+          }
+        }
+      }
+    }
+    document.to_string()
+  } else {
+    raw_html
+  };
 
   // Then the passes that change the tree.
   let prose_before = if opts.only_main_content {

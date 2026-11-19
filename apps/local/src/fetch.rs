@@ -152,6 +152,7 @@ impl Resolve for GuardedResolver {
 #[derive(Clone)]
 pub struct Fetcher {
   client: Client,
+  without_tls_verification: Client,
   policy: NetworkPolicy,
 }
 
@@ -159,6 +160,7 @@ pub struct Fetcher {
 pub struct FetchOptions {
   pub headers: HashMap<String, String>,
   pub timeout: Option<Duration>,
+  pub skip_tls_verification: bool,
 }
 
 impl Fetcher {
@@ -172,33 +174,50 @@ impl Fetcher {
     );
     default_headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
 
-    let redirect_policy = redirect::Policy::custom(move |attempt| {
-      if attempt.previous().len() >= MAX_REDIRECTS {
-        return attempt.error(Blocked(format!("more than {MAX_REDIRECTS} redirects")));
-      }
-      match guard::check_url(attempt.url(), policy) {
-        Ok(()) => attempt.follow(),
-        Err(e) => attempt.error(e),
-      }
-    });
-
-    let client = Client::builder()
-      .user_agent(user_agent.unwrap_or(USER_AGENT))
-      .default_headers(default_headers)
-      .redirect(redirect_policy)
-      .dns_resolver(Arc::new(GuardedResolver { policy }))
-      .connect_timeout(Duration::from_secs(10))
-      .pool_idle_timeout(Duration::from_secs(60))
-      .pool_max_idle_per_host(64)
-      .tcp_nodelay(true)
-      .build()
-      .map_err(|e| format!("could not build HTTP client: {e}"))?;
-
-    Ok(Self { client, policy })
+    let build = |skip_tls| {
+      Client::builder()
+        .user_agent(user_agent.unwrap_or(USER_AGENT))
+        .default_headers(default_headers.clone())
+        .redirect(redirect::Policy::none())
+        .no_proxy()
+        .dns_resolver(Arc::new(GuardedResolver { policy }))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(64)
+        .tcp_nodelay(true)
+        .tls_danger_accept_invalid_certs(skip_tls)
+        .build()
+        .map_err(|e| format!("could not build HTTP client: {e}"))
+    };
+    Ok(Self {
+      client: build(false)?,
+      without_tls_verification: build(true)?,
+      policy,
+    })
   }
 
   pub fn policy(&self) -> NetworkPolicy {
     self.policy
+  }
+
+  pub(crate) async fn send_webhook(
+    &self,
+    url: &Url,
+    headers: &HeaderMap,
+    payload: &serde_json::Value,
+  ) -> bool {
+    if guard::check_url(url, self.policy).is_err() {
+      return false;
+    }
+    self
+      .client
+      .post(url.clone())
+      .headers(headers.clone())
+      .json(payload)
+      .timeout(Duration::from_secs(5))
+      .send()
+      .await
+      .is_ok_and(|reply| reply.status().is_success())
   }
 
   /// Fetch a URL, retrying once when the connection itself failed (a reset,
@@ -215,20 +234,52 @@ impl Fetcher {
   }
 
   async fn fetch_once(&self, url: &Url, opts: &FetchOptions) -> Result<FetchResult, FetchError> {
-    guard::check_url(url, self.policy).map_err(|e| FetchError::Blocked(e.0))?;
-
     let timeout = opts.timeout.unwrap_or(Duration::from_secs(30));
-    let mut req = self.client.get(url.clone()).timeout(timeout);
-    for (k, v) in &opts.headers {
-      if let (Ok(name), Ok(value)) = (
-        HeaderName::from_bytes(k.as_bytes()),
-        HeaderValue::from_str(v),
-      ) {
-        req = req.header(name, value);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let client = if opts.skip_tls_verification {
+      &self.without_tls_verification
+    } else {
+      &self.client
+    };
+    let origin = url.origin();
+    let mut current = url.clone();
+    let mut redirects = 0;
+    let resp = loop {
+      guard::check_url(&current, self.policy).map_err(|e| FetchError::Blocked(e.0))?;
+      let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+      if remaining.is_zero() {
+        return Err(FetchError::Timeout);
       }
-    }
-
-    let resp = req.send().await.map_err(classify)?;
+      let mut req = client.get(current.clone()).timeout(remaining);
+      if current.origin() == origin {
+        for (k, v) in &opts.headers {
+          if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+          ) {
+            req = req.header(name, value);
+          }
+        }
+      }
+      let resp = req.send().await.map_err(classify)?;
+      let next = if matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+        resp
+          .headers()
+          .get(reqwest::header::LOCATION)
+          .and_then(|v| v.to_str().ok())
+          .and_then(|location| current.join(location).ok())
+      } else {
+        None
+      };
+      let Some(target) = next else { break resp };
+      if redirects == MAX_REDIRECTS {
+        return Err(FetchError::Blocked(format!(
+          "more than {MAX_REDIRECTS} redirects"
+        )));
+      }
+      current = target;
+      redirects += 1;
+    };
     let status = resp.status().as_u16();
     let final_url = resp.url().clone();
     let headers = resp.headers().clone();
@@ -296,6 +347,54 @@ fn classify(e: reqwest::Error) -> FetchError {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn request_headers_stay_on_the_original_origin_after_redirect() {
+    use axum::{http::HeaderMap, response::Redirect, routing::get, Router};
+
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+      .await
+      .unwrap();
+    let target_url = format!("http://{}/", target.local_addr().unwrap());
+    tokio::spawn(async move {
+      let app = Router::new().route(
+        "/",
+        get(|headers: HeaderMap| async move {
+          if headers.contains_key("x-fixture-token") {
+            "token received"
+          } else {
+            "no token"
+          }
+        }),
+      );
+      axum::serve(target, app).await.unwrap();
+    });
+
+    let source = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+      .await
+      .unwrap();
+    let source_url = Url::parse(&format!("http://{}/", source.local_addr().unwrap())).unwrap();
+    tokio::spawn(async move {
+      let app = Router::new().route(
+        "/",
+        get(move |headers: HeaderMap| {
+          let target_url = target_url.clone();
+          async move {
+            assert_eq!(headers.get("x-fixture-token").unwrap(), "fixture");
+            Redirect::temporary(&target_url)
+          }
+        }),
+      );
+      axum::serve(source, app).await.unwrap();
+    });
+    let fetcher = Fetcher::new(NetworkPolicy::AllowPrivate, None).unwrap();
+    let opts = FetchOptions {
+      headers: HashMap::from([("x-fixture-token".into(), "fixture".into())]),
+      ..Default::default()
+    };
+    let reply = fetcher.fetch(&source_url, &opts).await.unwrap();
+    assert_eq!(reply.body, "no token");
+  }
 
   #[test]
   fn charset_header_wins() {

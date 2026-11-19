@@ -5,6 +5,7 @@
 //! the first page that needs it and is reused after that.
 
 use std::{
+  collections::HashMap,
   path::PathBuf,
   sync::{
     atomic::{AtomicBool, Ordering},
@@ -15,8 +16,12 @@ use std::{
 
 use chromiumoxide::{
   browser::{Browser, BrowserConfig},
-  cdp::browser_protocol::network::{
-    EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent, ResourceType,
+  cdp::browser_protocol::{
+    fetch::{ContinueRequestParams, EnableParams, EventRequestPaused, HeaderEntry, RequestPattern},
+    network::{
+      BlockPattern, EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent, ResourceType,
+      SetBlockedUrLsParams,
+    },
   },
   error::CdpError,
   page::{Page, ScreenshotParams},
@@ -219,12 +224,85 @@ impl Drop for TemporaryProfile {
   }
 }
 
+struct HeaderInterceptor(tokio::task::JoinHandle<()>);
+
+impl Drop for HeaderInterceptor {
+  fn drop(&mut self) {
+    self.0.abort();
+  }
+}
+
+impl HeaderInterceptor {
+  async fn start(
+    page: &Page,
+    url: &Url,
+    headers: &HashMap<String, String>,
+  ) -> Result<Option<Self>, String> {
+    let headers: HashMap<_, _> = headers
+      .iter()
+      .filter_map(|(name, value)| {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).ok()?;
+        let name = name.as_str();
+        if matches!(
+          name,
+          "host" | "connection" | "content-length" | "transfer-encoding" | "proxy-authorization"
+        ) || reqwest::header::HeaderValue::from_str(value).is_err()
+        {
+          return None;
+        }
+        Some((name.to_string(), value.clone()))
+      })
+      .collect();
+    if headers.is_empty() {
+      return Ok(None);
+    }
+    let origin = url.origin();
+    let mut events = page
+      .event_listener::<EventRequestPaused>()
+      .await
+      .map_err(|e| e.to_string())?;
+    let pattern = RequestPattern::builder()
+      .url_pattern(format!("{}/*", origin.ascii_serialization()))
+      .build();
+    page
+      .execute(EnableParams::builder().pattern(pattern).build())
+      .await
+      .map_err(|e| e.to_string())?;
+    let page = page.clone();
+    let task = tokio::spawn(async move {
+      while let Some(event) = events.next().await {
+        let mut command = ContinueRequestParams::builder().request_id(event.request_id.clone());
+        if Url::parse(&event.request.url).is_ok_and(|request| request.origin() == origin) {
+          let original = event
+            .request
+            .headers
+            .inner()
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| !headers.contains_key(&name.to_ascii_lowercase()))
+            .filter_map(|(name, value)| Some(HeaderEntry::new(name, value.as_str()?)));
+          let additional = headers
+            .iter()
+            .map(|(name, value)| HeaderEntry::new(name, value));
+          command = command.headers(original.chain(additional));
+        }
+        if let Ok(command) = command.build() {
+          let _ = page.execute(command).await;
+        }
+      }
+    });
+    Ok(Some(Self(task)))
+  }
+}
+
 struct Launched {
   browser: Browser,
   handler: tokio::task::JoinHandle<()>,
   profile: TemporaryProfile,
   /// Every connection Chrome makes goes through this; dropped with Chrome.
   _proxy: crate::netguard::GuardProxy,
+  last_used: Instant,
 }
 
 impl Drop for Launched {
@@ -274,9 +352,11 @@ pub struct BrowserPool {
   chrome: PathBuf,
   policy: NetworkPolicy,
   user_agent: String,
+  verify_tls: bool,
   launched: Mutex<Option<Launched>>,
   closed: AtomicBool,
   pages: Semaphore,
+  capacity: u32,
 }
 
 /// Find a Chromium-family browser. `FIRECRAWL_CHROME_PATH` wins.
@@ -323,14 +403,26 @@ pub fn find_chrome() -> Option<PathBuf> {
 
 impl BrowserPool {
   pub fn new(policy: NetworkPolicy, user_agent: &str, max_pages: usize) -> Option<Arc<Self>> {
+    Self::new_with_tls(policy, user_agent, max_pages, true)
+  }
+
+  pub(crate) fn new_with_tls(
+    policy: NetworkPolicy,
+    user_agent: &str,
+    max_pages: usize,
+    verify_tls: bool,
+  ) -> Option<Arc<Self>> {
     let chrome = find_chrome()?;
+    let capacity = u32::try_from(max_pages.max(1)).ok()?;
     Some(Arc::new(Self {
       chrome,
       policy,
       user_agent: user_agent.to_string(),
+      verify_tls,
       launched: Mutex::new(None),
       closed: AtomicBool::new(false),
-      pages: Semaphore::new(max_pages.max(1)),
+      pages: Semaphore::new(capacity as usize),
+      capacity,
     }))
   }
 
@@ -350,7 +442,6 @@ impl BrowserPool {
       .chrome_executable(&self.chrome)
       .user_data_dir(&profile)
       .new_headless_mode()
-      .respect_https_errors()
       .window_size(1366, 900)
       .launch_timeout(Duration::from_secs(20))
       .request_timeout(Duration::from_secs(45))
@@ -362,7 +453,13 @@ impl BrowserPool {
         "disable-notifications",
         "disable-save-password-bubble",
       ])
-      .args(proxy.chrome_args())
+      .args(proxy.chrome_args());
+    let config = if self.verify_tls {
+      config.respect_https_errors()
+    } else {
+      config
+    };
+    let config = config
       .build()
       .map_err(|e| format!("browser configuration failed: {e}"))?;
     std::fs::create_dir_all(&profile)
@@ -383,6 +480,7 @@ impl BrowserPool {
       handler,
       profile,
       _proxy: proxy,
+      last_used: Instant::now(),
     })
   }
 
@@ -401,7 +499,8 @@ impl BrowserPool {
         // A freshly launched browser has already exercised the recovery path.
         may_retry = false;
       }
-      let launched = guard.as_ref().ok_or("browser is not running")?;
+      let launched = guard.as_mut().ok_or("browser is not running")?;
+      launched.last_used = Instant::now();
       let result = tokio::time::timeout(
         Duration::from_secs(8),
         launched.browser.new_page("about:blank"),
@@ -436,6 +535,8 @@ impl BrowserPool {
     wait_for: Duration,
     timeout: Duration,
     screenshot: bool,
+    block_ads: bool,
+    headers: &HashMap<String, String>,
   ) -> Result<Rendered, String> {
     guard::check_url(url, self.policy).map_err(|e| e.0)?;
     let deadline = tokio::time::Instant::now() + timeout;
@@ -447,9 +548,17 @@ impl BrowserPool {
     let page = tokio::time::timeout_at(deadline, self.new_page())
       .await
       .map_err(|_| timeout_error())??;
-    let result =
-      tokio::time::timeout_at(deadline, self.drive(&page, url, wait_for, screenshot)).await;
+    let result = tokio::time::timeout_at(
+      deadline,
+      self.drive(&page, url, wait_for, screenshot, block_ads, headers),
+    )
+    .await;
     let _ = tokio::time::timeout(Duration::from_secs(1), page.close()).await;
+    if let Ok(mut guard) = self.launched.try_lock() {
+      if let Some(launched) = guard.as_mut() {
+        launched.last_used = Instant::now();
+      }
+    }
     result.map_err(|_| timeout_error())?
   }
 
@@ -459,12 +568,32 @@ impl BrowserPool {
     url: &Url,
     wait_for: Duration,
     screenshot: bool,
+    block_ads: bool,
+    headers: &HashMap<String, String>,
   ) -> Result<Rendered, String> {
     page
       .set_user_agent(self.user_agent.as_str())
       .await
       .map_err(|e| format!("could not set the user agent: {e}"))?;
     let _ = page.evaluate_on_new_document(NETWORK_TRACKER).await;
+    let _headers = HeaderInterceptor::start(page, url, headers).await?;
+    if block_ads {
+      let domains = [
+        "doubleclick.net",
+        "googlesyndication.com",
+        "googleadservices.com",
+      ];
+      let patterns = domains
+        .into_iter()
+        .flat_map(|domain| [format!("*://{domain}:*/*"), format!("*://*.{domain}:*/*")]);
+      let _ = page
+        .execute(
+          SetBlockedUrLsParams::builder()
+            .url_patterns(patterns.map(|pattern| BlockPattern::new(pattern, true)))
+            .build(),
+        )
+        .await;
+    }
     let watch = NetWatch::start(page).await;
     let result = self
       .drive_watched(page, url, wait_for, screenshot, &watch)
@@ -582,6 +711,35 @@ impl BrowserPool {
     self.closed.store(true, Ordering::Relaxed);
     if let Some(mut launched) = guard.take() {
       launched.shutdown().await;
+    }
+  }
+
+  pub async fn state(&self) -> &'static str {
+    match self.launched.lock().await.as_mut() {
+      Some(browser) => {
+        if browser.is_running() {
+          "ready"
+        } else {
+          "disconnected"
+        }
+      }
+      None => "cold",
+    }
+  }
+
+  pub async fn stop_if_idle(&self, timeout: Duration) {
+    let Ok(_all_pages) = self.pages.try_acquire_many(self.capacity) else {
+      return;
+    };
+    let mut guard = self.launched.lock().await;
+    if !guard
+      .as_ref()
+      .is_some_and(|browser| browser.last_used.elapsed() >= timeout)
+    {
+      return;
+    }
+    if let Some(mut browser) = guard.take() {
+      browser.shutdown().await;
     }
   }
 }

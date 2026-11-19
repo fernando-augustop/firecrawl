@@ -64,6 +64,8 @@ mimalloc = "0.1.52"
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 sha2 = "0.10"
 getrandom = "0.3"
+jsonschema = { version = "0.61.2", default-features = false }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 
 [profile.release]
 lto = "fat"

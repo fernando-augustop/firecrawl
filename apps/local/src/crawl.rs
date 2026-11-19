@@ -45,6 +45,7 @@ pub struct CrawlOptions {
   pub crawl_entire_domain: bool,
   pub allow_subdomains: bool,
   pub allow_external_links: bool,
+  pub ignore_query_parameters: bool,
   /// "include" (default), "skip" or "only".
   pub sitemap: String,
   pub ignore_robots_txt: bool,
@@ -65,6 +66,7 @@ impl Default for CrawlOptions {
       crawl_entire_domain: false,
       allow_subdomains: false,
       allow_external_links: false,
+      ignore_query_parameters: false,
       sitemap: "include".into(),
       ignore_robots_txt: false,
       max_concurrency: None,
@@ -305,6 +307,35 @@ pub async fn crawl<F>(
 where
   F: FnMut(&Value),
 {
+  crawl_impl(engine, start, opts, true, |page| {
+    on_page(page);
+    Ok(())
+  })
+  .await
+}
+
+pub(crate) async fn crawl_to_store<F>(
+  engine: Arc<Engine>,
+  start: &str,
+  opts: &CrawlOptions,
+  on_page: F,
+) -> Result<CrawlOutcome, ScrapeError>
+where
+  F: FnMut(&Value) -> Result<(), ScrapeError>,
+{
+  crawl_impl(engine, start, opts, false, on_page).await
+}
+
+async fn crawl_impl<F>(
+  engine: Arc<Engine>,
+  start: &str,
+  opts: &CrawlOptions,
+  collect: bool,
+  mut on_page: F,
+) -> Result<CrawlOutcome, ScrapeError>
+where
+  F: FnMut(&Value) -> Result<(), ScrapeError>,
+{
   let seed = parse_url(start)?;
   let scope = Scope::new(&seed, opts)?;
   let limit = opts.limit.max(1);
@@ -339,7 +370,11 @@ where
                  frontier: &mut VecDeque<(Url, u32)>,
                  visited: &mut HashSet<String>,
                  blocked: &mut Vec<String>| {
-    let key = canonical(&url);
+    let mut for_key = url.clone();
+    if opts.ignore_query_parameters {
+      for_key.set_query(None);
+    }
+    let key = canonical(&for_key);
     if visited.contains(&key) {
       return;
     }
@@ -378,13 +413,15 @@ where
   let mut errors: Vec<Value> = Vec::new();
   let mut in_flight = FuturesUnordered::new();
   let mut started = 0usize;
+  let mut attempted = 0usize;
 
   loop {
-    while in_flight.len() < concurrency && started < limit {
+    while in_flight.len() < concurrency && started < limit && attempted < limit.saturating_mul(4) {
       let Some((url, depth)) = frontier.pop_front() else {
         break;
       };
       started += 1;
+      attempted += 1;
       let engine = engine.clone();
       let scrape_opts = opts.scrape_options.clone();
       in_flight.push(async move {
@@ -400,8 +437,10 @@ where
     };
     match res {
       Ok((doc, links)) => {
-        on_page(&doc);
-        pages.push(doc);
+        on_page(&doc)?;
+        if collect {
+          pages.push(doc);
+        }
         if depth < max_depth && opts.sitemap != "only" {
           for link in links {
             if let Ok(parsed) = Url::parse(&link) {
@@ -439,6 +478,7 @@ pub struct MapOptions {
   pub search: Option<String>,
   pub limit: usize,
   pub include_subdomains: bool,
+  pub ignore_query_parameters: bool,
   /// "include" (default), "skip" or "only".
   pub sitemap: String,
 }
@@ -449,6 +489,7 @@ impl Default for MapOptions {
       search: None,
       limit: 5000,
       include_subdomains: true,
+      ignore_query_parameters: false,
       sitemap: "include".into(),
     }
   }
@@ -488,7 +529,9 @@ pub async fn map(
   let mut seen = HashSet::new();
   let mut out = Vec::new();
   for c in candidates {
-    let Ok(url) = Url::parse(&c) else { continue };
+    let Ok(mut url) = Url::parse(&c) else {
+      continue;
+    };
     if !matches!(url.scheme(), "http" | "https") {
       continue;
     }
@@ -497,6 +540,9 @@ pub async fn map(
       host_key(&h) == seed_host || (opts.include_subdomains && registrable(&h) == seed_domain);
     if !on_site {
       continue;
+    }
+    if opts.ignore_query_parameters {
+      url.set_query(None);
     }
     let key = canonical(&url);
     if let Some(n) = &needle {

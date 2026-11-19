@@ -1,0 +1,27 @@
+[Unit]
+Description=Firecrawl Local with SearXNG and SQLite
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=firecrawl-local
+CacheDirectory=firecrawl-local
+WorkingDirectory=/var/lib/firecrawl-local
+Environment=HOME=/var/lib/firecrawl-local
+Environment=XDG_CACHE_HOME=/var/cache/firecrawl-local
+Environment=FIRECRAWL_LOCAL_JOB_DATABASE=/var/lib/firecrawl-local/jobs.sqlite3
+Environment=FIRECRAWL_LOCAL_BROWSER_IDLE_SECS=45
+EnvironmentFile=/etc/firecrawl-local/service.env
+EnvironmentFile=-/etc/firecrawl-local/extraction.env
+ExecStart=/opt/firecrawl-local/bin/firecrawl-local serve --host 127.0.0.1 --port ${FIRECRAWL_LOCAL_PORT} --allowed-host ${FIRECRAWL_LOCAL_ALLOWED_HOST}
+PrivateTmp=yes
+ProtectHome=yes
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=multi-user.target
