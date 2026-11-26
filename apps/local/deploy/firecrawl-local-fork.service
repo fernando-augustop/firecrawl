@@ -13,6 +13,7 @@ Environment=HOME=/var/lib/firecrawl-local
 Environment=XDG_CACHE_HOME=/var/cache/firecrawl-local
 Environment=FIRECRAWL_LOCAL_JOB_DATABASE=/var/lib/firecrawl-local/jobs.sqlite3
 Environment=FIRECRAWL_LOCAL_BROWSER_IDLE_SECS=45
+Environment=FIRECRAWL_CLOUD=off
 EnvironmentFile=/etc/firecrawl-local/service.env
 EnvironmentFile=-/etc/firecrawl-local/extraction.env
 ExecStart=/opt/firecrawl-local/bin/firecrawl-local serve --host 127.0.0.1 --port ${FIRECRAWL_LOCAL_PORT} --allowed-host ${FIRECRAWL_LOCAL_ALLOWED_HOST}

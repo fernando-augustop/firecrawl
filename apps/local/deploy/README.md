@@ -12,6 +12,8 @@ FIRECRAWL_LOCAL_PUBLIC_URL=https://crawler.example.internal:13013
 FIRECRAWL_LOCAL_SEARXNG_ENDPOINT=http://127.0.0.1:13015/search
 ```
 
+The unit sets `FIRECRAWL_CLOUD=off`. Without it the binary defaults to `auto`: a page the local engine reports as blocked is retried on Firecrawl Cloud, and any route this server does not implement is passed on to Firecrawl Cloud. With `off`, a blocked page comes back with `blocked: true` and a warning, and a cloud-only route answers 501 `CLOUD_ONLY`.
+
 Set `search.formats` in the SearXNG settings to include `json`. Keep the SearXNG port local and configure its own server secret. Put any extraction credentials in root-readable `/etc/firecrawl-local/extraction.env` with mode 0600. The optional OpenAI-compatible integration uses `FIRECRAWL_LOCAL_LLM_ENDPOINT`, `FIRECRAWL_LOCAL_LLM_MODEL`, and `FIRECRAWL_LOCAL_LLM_KEY`. Only explicit `json`, `summary`, or `question` requests send scraped text to that provider.
 
 Reload systemd and use `systemctl enable --now firecrawl-local-fork.service`. Serve the API through a private proxy and pass the configured Host header. Check `/health`, `/ready`, and `/v2/search` through the proxy. Cold Chromium startup is expected for the first rendering request after 45 seconds of browser inactivity.
